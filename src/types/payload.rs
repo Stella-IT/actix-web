@@ -7,10 +7,11 @@ use std::task::{Context, Poll};
 use actix_http::error::{Error, ErrorBadRequest, PayloadError};
 use actix_http::HttpMessage;
 use bytes::{Bytes, BytesMut};
+use encoding_rs::Encoding;
 use encoding_rs::UTF_8;
 use futures_core::stream::Stream;
-use futures_util::future::{err, ok, Either, FutureExt, LocalBoxFuture, Ready};
-use futures_util::StreamExt;
+use futures_util::future::{ready, FutureExt, LocalBoxFuture, Ready};
+use futures_util::{ready, StreamExt};
 use mime::Mime;
 
 use crate::extract::FromRequest;
@@ -103,7 +104,7 @@ impl FromRequest for Payload {
 
     #[inline]
     fn from_request(_: &HttpRequest, payload: &mut dev::Payload) -> Self::Future {
-        ok(Payload(payload.take()))
+        ready(Ok(Payload(payload.take())))
     }
 }
 
@@ -133,12 +134,9 @@ impl FromRequest for Payload {
 /// }
 /// ```
 impl FromRequest for Bytes {
-    type Config = PayloadConfig;
     type Error = Error;
-    type Future = Either<
-        LocalBoxFuture<'static, Result<Bytes, Error>>,
-        Ready<Result<Bytes, Error>>,
-    >;
+    type Future = FromRequestBytesFuture;
+    type Config = PayloadConfig;
 
     #[inline]
     fn from_request(req: &HttpRequest, payload: &mut dev::Payload) -> Self::Future {
@@ -146,12 +144,32 @@ impl FromRequest for Bytes {
         let cfg = PayloadConfig::from_req(req);
 
         if let Err(e) = cfg.check_mimetype(req) {
-            return Either::Right(err(e));
+            return FromRequestBytesFuture::Error(Some(e));
         }
 
         let limit = cfg.limit;
-        let fut = HttpMessageBody::new(req, payload).limit(limit);
-        Either::Left(async move { Ok(fut.await?) }.boxed_local())
+        let body = HttpMessageBody::new(req, payload).limit(limit);
+
+        FromRequestBytesFuture::HttpMessageBody(body)
+    }
+}
+
+pub enum FromRequestBytesFuture {
+    Error(Option<Error>),
+    HttpMessageBody(HttpMessageBody),
+}
+
+impl Future for FromRequestBytesFuture {
+    type Output = Result<Bytes, Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match this {
+            FromRequestBytesFuture::Error(e) => Poll::Ready(Err(e.take().unwrap())),
+            FromRequestBytesFuture::HttpMessageBody(body) => {
+                Pin::new(body).poll(cx).map_err(Into::into)
+            }
+        }
     }
 }
 
@@ -183,12 +201,9 @@ impl FromRequest for Bytes {
 /// }
 /// ```
 impl FromRequest for String {
-    type Config = PayloadConfig;
     type Error = Error;
-    type Future = Either<
-        LocalBoxFuture<'static, Result<String, Error>>,
-        Ready<Result<String, Error>>,
-    >;
+    type Future = FromRequestStringFuture;
+    type Config = PayloadConfig;
 
     #[inline]
     fn from_request(req: &HttpRequest, payload: &mut dev::Payload) -> Self::Future {
@@ -196,34 +211,50 @@ impl FromRequest for String {
 
         // check content-type
         if let Err(e) = cfg.check_mimetype(req) {
-            return Either::Right(err(e));
+            return FromRequestStringFuture::Error(Some(e));
         }
 
         // check charset
         let encoding = match req.encoding() {
             Ok(enc) => enc,
-            Err(e) => return Either::Right(err(e.into())),
+            Err(e) => return FromRequestStringFuture::Error(Some(e.into())),
         };
+
         let limit = cfg.limit;
-        let fut = HttpMessageBody::new(req, payload).limit(limit);
+        let body = HttpMessageBody::new(req, payload).limit(limit);
 
-        Either::Left(
-            async move {
-                let body = fut.await?;
+        FromRequestStringFuture::HttpMessageBody(body, encoding)
+    }
+}
 
-                if encoding == UTF_8 {
-                    Ok(str::from_utf8(body.as_ref())
+pub enum FromRequestStringFuture {
+    Error(Option<Error>),
+    HttpMessageBody(HttpMessageBody, &'static Encoding),
+}
+
+impl Future for FromRequestStringFuture {
+    type Output = Result<String, Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match this {
+            FromRequestStringFuture::Error(e) => Poll::Ready(Err(e.take().unwrap())),
+            FromRequestStringFuture::HttpMessageBody(body, encoding) => {
+                let res = ready!(Pin::new(body).poll(cx))?;
+                let res = if *encoding == UTF_8 {
+                    str::from_utf8(&res)
                         .map_err(|_| ErrorBadRequest("Can not decode body"))?
-                        .to_owned())
+                        .to_owned()
                 } else {
-                    Ok(encoding
-                        .decode_without_bom_handling_and_without_replacement(&body)
+                    (*encoding)
+                        .decode_without_bom_handling_and_without_replacement(&res)
                         .map(|s| s.into_owned())
-                        .ok_or_else(|| ErrorBadRequest("Can not decode body"))?)
-                }
+                        .ok_or_else(|| ErrorBadRequest("Can not decode body"))?
+                };
+
+                Poll::Ready(Ok(res))
             }
-            .boxed_local(),
-        )
+        }
     }
 }
 

@@ -8,6 +8,7 @@ use std::{fmt, ops};
 
 use bytes::BytesMut;
 use futures_util::future::{err, ok, FutureExt, LocalBoxFuture, Ready};
+use futures_util::ready;
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -173,37 +174,64 @@ where
     T: DeserializeOwned + 'static,
 {
     type Error = Error;
-    type Future = LocalBoxFuture<'static, Result<Self, Error>>;
+    type Future = FromRequestJsonFuture<T>;
     type Config = JsonConfig;
 
     #[inline]
     fn from_request(req: &HttpRequest, payload: &mut Payload) -> Self::Future {
-        let req2 = req.clone();
         let config = JsonConfig::from_req(req);
 
         let limit = config.limit;
         let ctype = config.content_type.clone();
         let err_handler = config.err_handler.clone();
 
-        JsonBody::new(req, payload, ctype)
-            .limit(limit)
-            .map(move |res| match res {
-                Err(e) => {
-                    log::debug!(
-                        "Failed to deserialize Json from payload. \
-                         Request path: {}",
-                        req2.path()
-                    );
+        FromRequestJsonFuture {
+            req: Some(req.clone()),
+            fut: JsonBody::new(req, payload, ctype).limit(limit),
+            err_handler,
+        }
+    }
+}
 
-                    if let Some(err) = err_handler {
-                        Err((*err)(e, &req2))
-                    } else {
-                        Err(e.into())
-                    }
+type JsonErrorHandler =
+    Option<Arc<dyn Fn(JsonPayloadError, &HttpRequest) -> Error + Send + Sync>>;
+
+pub struct FromRequestJsonFuture<T> {
+    req: Option<HttpRequest>,
+    fut: JsonBody<T>,
+    err_handler: JsonErrorHandler,
+}
+
+impl<T> Future for FromRequestJsonFuture<T>
+where
+    T: DeserializeOwned + 'static,
+{
+    type Output = Result<Json<T>, Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        let res = ready!(Pin::new(&mut this.fut).poll(cx));
+
+        let res = match res {
+            Err(e) => {
+                let req = this.req.take().unwrap();
+                log::debug!(
+                    "Failed to deserialize Json from payload. \
+                         Request path: {}",
+                    req.path()
+                );
+
+                if let Some(err) = this.err_handler.as_ref() {
+                    Err((*err)(e, &req))
+                } else {
+                    Err(e.into())
                 }
-                Ok(data) => Ok(Json(data)),
-            })
-            .boxed_local()
+            }
+            Ok(data) => Ok(Json(data)),
+        };
+
+        Poll::Ready(res)
     }
 }
 
@@ -248,8 +276,7 @@ where
 #[derive(Clone)]
 pub struct JsonConfig {
     limit: usize,
-    err_handler:
-        Option<Arc<dyn Fn(JsonPayloadError, &HttpRequest) -> Error + Send + Sync>>,
+    err_handler: JsonErrorHandler,
     content_type: Option<Arc<dyn Fn(mime::Mime) -> bool + Send + Sync>>,
 }
 
